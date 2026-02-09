@@ -9,6 +9,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from pr_agent.client import OllamaClient
 from pr_agent.prompts import get_messages
 from pr_agent.search import get_random_quote_context
+from pr_agent.utils import generate_character_prompt
 
 # Page Config
 st.set_page_config(page_title="PR Message Generator", page_icon="🚀", layout="wide")
@@ -70,6 +71,11 @@ def main():
     new_index = character_names.index(selected_name)
     if new_index != active_index:
         config["active_character_index"] = new_index
+        # Reset edit form session state when character changes
+        if "edit_char_desc" in st.session_state:
+            del st.session_state.edit_char_desc
+        if "edit_char_quotes" in st.session_state:
+            del st.session_state.edit_char_quotes
         if save_config(config):
             st.rerun()
     
@@ -88,23 +94,199 @@ def main():
     st.sidebar.header("現在の担当 👤")
     st.sidebar.info(f"**名前:** {char_name}\n\n**作品:** {work_name}")
     
+    # Display saved quotes if available
+    if "quotes" in character_config and character_config["quotes"]:
+        with st.sidebar.expander("💬 名言・セリフ", expanded=False):
+            for i, quote in enumerate(character_config["quotes"], 1):
+                st.caption(f"{i}. {quote}")
+    
     # Sidebar: Settings Editor
     with st.sidebar.expander("設定エディタ ⚙️"):
+        st.markdown("### モデル管理 🤖")
+        
+        client = OllamaClient(api_url=config["api_url"], model=config["model"])
+        
+        # Current model
+        st.info(f"**現在のモデル:** {config.get('model', 'llama3')}")
+        
+        # Model switching
+        st.markdown("**モデル切り替え**")
+        
+        # Add refresh button
+        if st.button("🔄 モデル一覧を更新", key="refresh_models"):
+            st.rerun()
+        
+        try:
+            local_models = client.list_local_models()
+            if local_models:
+                model_names = [m["name"] for m in local_models]
+                model_sizes = [m.get("size", 0) for m in local_models]
+                current_model = config.get("model", "llama3")
+                
+                st.caption(f"📊 {len(model_names)}個のモデルが見つかりました")
+                
+                # Create display options with size info
+                def format_size(size_bytes):
+                    if size_bytes == 0:
+                        return "不明"
+                    gb = size_bytes / (1024**3)
+                    return f"{gb:.1f}GB"
+                
+                model_options = [f"{name} ({format_size(size)})" for name, size in zip(model_names, model_sizes)]
+                
+                try:
+                    current_idx = model_names.index(current_model)
+                except ValueError:
+                    current_idx = 0
+                
+                selected_idx = st.selectbox(
+                    "ローカルモデル",
+                    range(len(model_options)),
+                    format_func=lambda i: model_options[i],
+                    index=current_idx,
+                    key="model_selector"
+                )
+                
+                if st.button("モデルを切り替え", key="switch_model"):
+                    # Unload current model before switching
+                    try:
+                        client.unload_model(current_model)
+                    except:
+                        pass  # Ignore unload errors
+                    
+                    config["model"] = model_names[selected_idx]
+                    if save_config(config):
+                        st.success(f"モデルを {model_names[selected_idx]} に切り替えました！")
+                        st.rerun()
+            else:
+                st.warning("ローカルモデルが見つかりません")
+                st.info("💡 モデルをダウンロードしてください")
+        except Exception as e:
+            st.error(f"モデル一覧の取得に失敗: {e}")
+        
+        st.markdown("---")
+        st.markdown("**モデルダウンロード**")
+        
+        popular_models = OllamaClient.get_popular_models()
+        
+        # Display model info
+        model_options = [f"{m['name']} ({m['params']}, {m['size']})" for m in popular_models]
+        model_names = [m['name'] for m in popular_models]
+        
+        selected_idx = st.selectbox(
+            "人気モデル",
+            range(len(model_options)),
+            format_func=lambda i: model_options[i],
+            key="download_selector"
+        )
+        
+        # Show description
+        st.caption(popular_models[selected_idx]['desc'])
+        
+        custom_model = st.text_input("またはカスタムモデル名", key="custom_model", placeholder="例: llama3.1:70b")
+        
+        if st.button("ダウンロード 📥", key="download_model"):
+            model_to_download = custom_model if custom_model else model_names[selected_idx]
+            
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            def update_progress(chunk):
+                status = chunk.get("status", "")
+                if "total" in chunk and "completed" in chunk:
+                    progress = chunk["completed"] / chunk["total"]
+                    progress_bar.progress(min(progress, 1.0))
+                    status_text.text(f"{status}: {int(progress * 100)}%")
+                else:
+                    status_text.text(status)
+            
+            try:
+                client.pull_model(model_to_download, progress_callback=update_progress)
+                progress_bar.progress(1.0)
+                status_text.text("完了！")
+                st.success(f"{model_to_download} のダウンロードが完了しました！")
+                st.rerun()
+            except Exception as e:
+                st.error(f"ダウンロード失敗: {e}")
+        
+        st.markdown("---")
         st.markdown("### 現在のキャラクター編集")
+        
+        # Initialize session state for edit form
+        if "edit_char_desc" not in st.session_state:
+            st.session_state.edit_char_desc = character_config.get("description", "")
+        if "edit_char_quotes" not in st.session_state:
+            st.session_state.edit_char_quotes = "\n".join(character_config.get("quotes", []))
+        
         with st.form("edit_character_form"):
             new_name = st.text_input("名前", value=char_name)
             new_work = st.text_input("作品名", value=work_name)
-            new_desc = st.text_area("詳細・口調", value=character_config.get("description", ""), height=100)
+            new_desc = st.text_area("詳細・口調", value=st.session_state.edit_char_desc, height=100)
+            new_quotes = st.text_area("名言・セリフ（1行1セリフ）", value=st.session_state.edit_char_quotes, height=150, help="各行に1つずつセリフを入力してください")
             
-            submitted = st.form_submit_button("更新 💾")
+            col1, col2 = st.columns(2)
+            with col1:
+                edit_generate_btn = st.form_submit_button("詳細を自動生成 🤖", type="secondary")
+            with col2:
+                submitted = st.form_submit_button("更新 💾", type="primary")
+            
+            if edit_generate_btn:
+                if new_name and new_work:
+                    with st.spinner(f"{new_name} の詳細を生成中..."):
+                        try:
+                            # ウェブ検索で名言を取得
+                            st.info(f"🔍 検索中: {new_name} {new_work}")
+                            quote_context, selected_quotes = get_random_quote_context(new_name, new_work)
+                            
+                            # デバッグ情報を表示
+                            with st.expander("🔍 ウェブ検索結果（デバッグ）", expanded=True):
+                                if quote_context:
+                                    st.text_area("検索結果", quote_context, height=200)
+                                else:
+                                    st.warning("検索結果が見つかりませんでした。LLMの知識のみで生成します。")
+                                    st.caption("💡 ヒント: キャラクター名や作品名が正確か確認してください")
+                            
+                            prompt = generate_character_prompt(new_name, new_work, quote_context)
+                            
+                            generated = client.generate_text(prompt)
+                            st.session_state.edit_char_desc = generated
+                            
+                            # Update quotes in session state
+                            if selected_quotes:
+                                st.session_state.edit_char_quotes = "\n".join(selected_quotes)
+                                characters[active_index]["quotes"] = selected_quotes
+                                config["characters"] = characters
+                                save_config(config)
+                            
+                            st.success("生成完了！フォームが更新されました。")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"生成に失敗しました: {e}")
+                            import traceback
+                            with st.expander("エラー詳細"):
+                                st.code(traceback.format_exc())
+                else:
+                    st.warning("名前と作品名を入力してください。")
+            
             if submitted:
                 characters[active_index]["name"] = new_name
                 characters[active_index]["work"] = new_work
                 characters[active_index]["description"] = new_desc
+                
+                # Save quotes
+                quotes_list = [q.strip() for q in new_quotes.split("\n") if q.strip()]
+                if quotes_list:
+                    characters[active_index]["quotes"] = quotes_list
+                elif "quotes" in characters[active_index]:
+                    del characters[active_index]["quotes"]
+                
                 config["characters"] = characters
+                st.session_state.edit_char_desc = new_desc
+                st.session_state.edit_char_quotes = new_quotes
                 
                 if save_config(config):
-                    st.success("更新しました！")
+                    st.success(f"✅ {new_name} の情報を更新しました！")
+                    st.balloons()
                     st.rerun()
         
         st.markdown("---")
@@ -138,20 +320,40 @@ def main():
                     with st.spinner(f"{add_char_name} の詳細を生成中..."):
                         try:
                             client = OllamaClient(api_url=config["api_url"], model=config["model"])
-                            prompt = f"""あなたは「{add_char_name}」（作品名: {add_char_work}）というキャラクターの専門家です。
-このキャラクターの性格、口調、決め台詞、特徴を200文字程度で簡潔に説明してください。
-PRメッセージ生成時にこのキャラクターになりきるための情報として使用します。
-
-出力形式: 説明文のみを出力してください。見出しや前置きは不要です。"""
                             
+                            # ウェブ検索で名言を取得
+                            print(f"[DEBUG] Auto-generating character description for: {add_char_name} ({add_char_work})")
+                            st.info(f"🔍 検索中: {add_char_name} {add_char_work}")
+                            quote_context, selected_quotes = get_random_quote_context(add_char_name, add_char_work)
+                            
+                            # デバッグ情報を表示
+                            with st.expander("🔍 ウェブ検索結果（デバッグ）", expanded=True):
+                                if quote_context:
+                                    st.text_area("検索結果", quote_context, height=200)
+                                else:
+                                    st.warning("検索結果が見つかりませんでした。LLMの知識のみで生成します。")
+                                    st.caption("💡 ヒント: キャラクター名や作品名が正確か確認してください")
+                            
+                            prompt = generate_character_prompt(add_char_name, add_char_work, quote_context)
+                            
+                            print(f"[DEBUG] Generating description with LLM...")
                             generated = client.generate_text(prompt)
+                            print(f"[DEBUG] Generated description: {generated[:100]}...")
+                            
                             st.session_state.temp_char_name = add_char_name
                             st.session_state.temp_char_work = add_char_work
                             st.session_state.temp_char_desc = generated
+                            
+                            # Store quotes in session state for later use
+                            if selected_quotes:
+                                st.session_state.temp_char_quotes = selected_quotes
+                            
                             st.success("生成完了！フォームが更新されました。")
                             st.rerun()
                         except Exception as e:
                             st.error(f"生成に失敗しました: {e}")
+                            import traceback
+                            print(f"[ERROR] Character generation failed: {traceback.format_exc()}")
                 else:
                     st.warning("名前と作品名を入力してください。")
             
@@ -162,6 +364,11 @@ PRメッセージ生成時にこのキャラクターになりきるための情
                         "work": add_char_work,
                         "description": add_char_desc
                     }
+                    
+                    # Add quotes if available
+                    if "temp_char_quotes" in st.session_state and st.session_state.temp_char_quotes:
+                        new_character["quotes"] = st.session_state.temp_char_quotes
+                    
                     characters.append(new_character)
                     config["characters"] = characters
                     config["active_character_index"] = len(characters) - 1
@@ -170,17 +377,15 @@ PRメッセージ生成時にこのキャラクターになりきるための情
                     st.session_state.temp_char_name = ""
                     st.session_state.temp_char_work = ""
                     st.session_state.temp_char_desc = ""
+                    if "temp_char_quotes" in st.session_state:
+                        del st.session_state.temp_char_quotes
                     
                     if save_config(config):
-                        st.success(f"{add_char_name} を追加しました！")
+                        st.success(f"🎉 {add_char_name} を追加しました！")
+                        st.balloons()
                         st.rerun()
                 else:
                     st.warning("名前を入力してください。")
-
-
-
-
-
 
         
         # Delete character
@@ -241,7 +446,7 @@ PRメッセージ生成時にこのキャラクターになりきるための情
                 if config.get("use_search", False) and char_name:
                     with st.status(f"{char_name} の名言を検索中...", expanded=False) as status:
                         try:
-                            search_context = get_random_quote_context(char_name, work_name)
+                            search_context, _ = get_random_quote_context(char_name, work_name)
                             status.update(label="検索完了！", state="complete")
                         except Exception as e:
                             status.update(label="検索失敗 (名言なしで続行します)", state="error")
